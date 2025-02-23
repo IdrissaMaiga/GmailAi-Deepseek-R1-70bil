@@ -18,13 +18,19 @@ export async function GET(req: Request) {
     //let's exchange the code for an access token
     try {
         const { tokens } = await oauth2Client.getToken(code);
-        console.log(tokens);
+       
+    console.log('Access Token:', tokens.access_token);
+    console.log('Refresh Token:', tokens.refresh_token);
         //this stores the token in the oauth2Client
         //oauth2Client.setCredentials(tokens);        
         //store the token in a cookie or a database
         cookies().set({
             name: 'google_access_token',
-            value: tokens.access_token || '',  // the access token
+            value: JSON.stringify({
+                token: tokens.access_token || '',
+                refresh_token: tokens.refresh_token || ''
+            }), // the access token
+            
             httpOnly: true,  // for security, the cookie is accessible only by the server
             secure: process.env.NODE_ENV === 'production',  // send cookie over HTTPS only in production
             path: '/',  // cookie is available on every route

@@ -1,31 +1,49 @@
 
   import { NextRequest, NextResponse } from "next/server";
-  import { google } from "googleapis";
-  import { cookies } from "next/headers";
-  import oauth2Client from "../../lib/google-oauth";
-  import Groq from "groq-sdk";
+  import { gmail_v1, google } from "googleapis";
+  import oauth2Client, { verifyAndRefreshToken } from "../../lib/google-oauth";
+  import { Mistral } from "@mistralai/mistralai";
+  import { convert } from "html-to-text";
+const apiKey = process.env.MISTRAL_API_KEY;
+const modelName="ministral-8b-latest"
+const mistral = new Mistral({apiKey: apiKey});
+
+
+interface Command {
+  command: "retrieve" | "read" | "send" | "reply" | "delete" | "archive" | "mark_read" | "mark_unread" | "get_starred" | "ai_process";
+  params: Record<string, any>;
+}
+
+interface Attachment {
+  filename: string;
+  mimeType: string;
+  url: string;
+}
+
+interface ResponseMetadata {
+  tone: string;
+  summary: string;
+}
+
+interface ChatResponse {
   
-  // Initialize Groq
-  const groq = new Groq({
-    apiKey: process.env["AI_API_KEY"] || "",
-  });
+      
+        
+              message: string; // AI-generated reply content
+         
+          metadata: ResponseMetadata;
+          attachments: Attachment[];
+     
   
-  const modelName = "deepseek-r1-distill-llama-70b";
-  
-  if (!groq.apiKey) {
-    throw new Error("Missing GROQ_API_KEY environment variable");
-  }
-  
+}
+type AIResponseCommand = Command[]; // The AI should always return an array of commands
+
   export async function POST(req: NextRequest) {
-    const cookieStore = cookies();
-    const accessToken = cookieStore.get("google_access_token")?.value;
-  
-    if (!accessToken) {
-      return NextResponse.json({ error: "No access token found" }, { status: 401 });
+    const tokenData = await verifyAndRefreshToken();
+    if (tokenData.error) {
+        return NextResponse.json({ error: tokenData.error }, { status: tokenData.status });
     }
-  
-    oauth2Client.setCredentials({ access_token: accessToken });
-    
+    oauth2Client.setCredentials({ access_token: tokenData.accessToken });
     const gmail = google.gmail({ version: "v1", auth: oauth2Client });
   
     const body = await req.json();
@@ -44,94 +62,82 @@
   // AI Maps User Input to Commands using Groq
   const aiCommandMap = async (userInput: string) => {
     const prompt = `
-      Only give the array no other text because I going to give your answer to a function
+      Only give the json array no other text because I going to give your answer to a function
       Map the following user input to one or more actions, and always return the result as an array of commands.
       The only valid commands are: 
-      "retrieve", "read", "send", "reply", "delete", "archive", "mark_read", "mark_unread", "get_starred", "ai_process".
+      "retrieve", "process", "send", "reply", "delete", "archive", "mark_read", "mark_unread".
       
       Examples:
   
       1. "Show me unread emails" → [{ "command": "retrieve", "params": { "query": "is:unread" } }]
       2. "Send an email to john@example.com with subject 'Meeting' and message 'Let's discuss tomorrow'" 
-         → [{ "command": "send", "params": { "to": "john@example.com", "subject": "Meeting", "message": "Let's discuss tomorrow" } }]
+         → data:[{ "command": "send", "params": { "to": "john@example.com", "subject": "Meeting", "message": "Let's discuss tomorrow" } }]
       3. "Mark all emails from yesterday as read" 
-         → [
+         → data:[
               { "command": "retrieve", "params": { "query": "after:yesterday" } }, 
               { "command": "mark_read", "params": { "emailId": "<emailId>" } }
             ]
       4. "Reply to email with ID 98765 with message 'Got it!'" 
-         → [{ "command": "reply", "params": { "emailId": "98765", "message": "Got it!" } }]
+         →data: [{ "command": "reply", "params": { "emailId": "98765", "message": "Got it!" } }]
       5. "Delete the email with ID 56789" 
-         → [{ "command": "delete", "params": { "emailId": "56789" } }]
+         → data:[{ "command": "delete", "params": { "emailId": "56789" } }]
       6. "Archive the email with ID 12345" 
-         → [{ "command": "archive", "params": { "emailId": "12345" } }]
+         → data:[{ "command": "archive", "params": { "emailId": "12345" } }]
       7. "Mark the email with ID 67890 as unread" 
-         → [{ "command": "mark_unread", "params": { "emailId": "67890" } }]
-      8. "Retrieve my starred emails" 
-         → [{ "command": "get_starred", "params": {} }]
-      9. "Process this email content with AI: 'Please summarize the key points from this meeting'" 
-         → [{ "command": "ai_process", "params": { "content": "Please summarize the key points from this meeting" } }]
-      10. "Show all emails with subject 'Invoice'" 
-          → [{ "command": "retrieve", "params": { "query": "subject:Invoice" } }]
-      11. "Reply to email ID 23456 with message 'Thanks for the update!'" 
-          → [{ "command": "reply", "params": { "emailId": "23456", "message": "Thanks for the update!" } }]
-      12. "Delete all emails from 'spam@example.com'" 
-          → [
+         → data:[{ "command": "mark_unread", "params": { "emailId": "67890" } }]
+      8. "Show all emails with subject 'Invoice'" 
+          → data:[{ "command": "retrieve", "params": { "query": "subject:Invoice" } }]
+      9. "Reply to email ID 23456 with message 'Thanks for the update!'" 
+          → data:[{ "command": "reply", "params": { "emailId": "23456", "message": "Thanks for the update!" } }]
+      10. "Delete all emails from 'spam@example.com'" 
+          →data:[
               { "command": "retrieve", "params": { "query": "from:spam@example.com" } },
               { "command": "delete", "params": { "emailId": "<emailId>" } }
             ]
+      11. "Can you process and tell me what is this email about email ID 23456" 
+          → data:[{ "command": "process", "params": { "emailId": "23456"} }]
       
       User Input: "${userInput}"
   
       Please map this user input to a corresponding action(s) and return the result as an array of commands using only the valid commands listed above I do not want explanation just give the array.
     `;
   
-    const response = await groq.chat.completions.create({
-        messages: [{ role: "user", content: prompt }],
-        model: modelName,
-        temperature: 0.6,
-        max_completion_tokens: 4096,
-        top_p: 0.95,
-      });
-      
-      console.log(response.choices[0].message.content);
-      
-      try {
-        // Convert function declaration to a function expression (arrow function)
-        const extractLastJsonArray = (text: string): any => {
-          // Ensure text is not null or undefined before matching
-          if (!text) {
-            return null; // or handle the null case as needed
-          }
-          const matches = text.match(/\[\s*\{[\s\S]*?\}\s*\]/g);
-          return matches ? JSON.parse(matches[matches.length - 1]) : null;
-        };
-      
-        // Ensure response content is not null or empty
-        const content = response.choices[0].message.content || '';
-        const lastJsonArray = extractLastJsonArray(content) || [];
-        console.log(lastJsonArray);
-        
-        return lastJsonArray;
-      } catch (error) {
-        console.error(error);
-        return [];
-      }
-      
+    const chatResponse = await mistral.chat.complete({
+      model: modelName,
+      messages: [{ role: "user", content: prompt }],
+      responseFormat: { type: "json_object" },
+    });
+  
+    // Ensure content is always treated as a string
+    const content = chatResponse?.choices?.[0]?.message?.content;
+    console.log(content,chatResponse)
+    if (Array.isArray(content)) {
+      console.error("Expected string but received array:", content);
+      return [];
+    }
+  
+    try {
+      return JSON.parse(content ?? "[]"); // Ensure safe parsing
+    } catch (error) {
+      console.error("Failed to parse AI response:", error);
+      return [];
+    }
       
   };
   
   // Execute Commands Based on AI Processing
   // Execute Commands Based on AI Processing
-const executeCommands = async (actions: any[], gmail: any) => {
-    const results = [];
+  const executeCommands = async (actions: AIResponseCommand, gmail: any) => {
+    const results: { command: string; result?: any; error?: string }[] = [];
+  
+    console.log("Executing actions:", actions);
   
     for (const action of actions) {
       const { command, params } = action;
       if (commandMap[command]) {
         try {
           const result = await commandMap[command](params, gmail);
-          results.push({ command, result: result }); // Stringify the result
+          results.push({ command, result });
         } catch (error: any) {
           results.push({ command, error: error.message || "Execution failed" });
         }
@@ -140,156 +146,183 @@ const executeCommands = async (actions: any[], gmail: any) => {
       }
     }
   
+    console.log("Execution results:", results);
     return results;
   };
+  
   
   
   // Command Map
   const commandMap: Record<string, (params: any, gmail: any) => Promise<any>> = {
     retrieve: async ({ query }, gmail) => getEmails(query ?? "", gmail),
-    read: async ({ emailId }, gmail) => getEmailDetails(emailId ?? "", gmail),
+    process: async ({ emailId }, gmail) => getEmailDetails(emailId ?? "", gmail),
     send: async ({ to, subject, message }, gmail) => sendEmail(to ?? "", subject ?? "", message ?? "", gmail),
     reply: async ({ emailId, message }, gmail) => replyToEmail(emailId ?? "", message ?? "", gmail),
     delete: async ({ emailId }, gmail) => deleteEmail(emailId ?? "", gmail),
     archive: async ({ emailId }, gmail) => archiveEmail(emailId ?? "", gmail),
     mark_read: async ({ emailId }, gmail) => markEmailAsRead(emailId ?? "", gmail),
     mark_unread: async ({ emailId }, gmail) => markEmailAsUnread(emailId ?? "", gmail),
-    get_starred: async (_, gmail) => getStarredEmails(gmail),
-    ai_process: async ({ content }) => aiProcessEmail(content),
   };
   
  // AI Email Processing with Groq
 async function aiProcessEmail(content: string) {
-    const response = await groq.chat.completions.create({
-      messages: [
-        {
-          role: "user",
-          content: `What are these emails about? ${content}`,
-        },
-      ],
-      model: modelName,
-      temperature: 0.6,
-      max_completion_tokens: 4096,
-      top_p: 0.95,
-    });
+  const chatResponse = await mistral.chat.complete({
+    model: modelName,
+    messages: [
+      { role: "user", content: content }
+    ],
+   
+  });
   
-    return response.choices[0].message.content;
+    return chatResponse?.choices?.[0].message.content;
   }
   
+  async function summarizeData(groupedLLData: any) {
+    try {
+      const prompt = `Please summarize the following email thread data:\n\n${groupedLLData.join("\n")}`;
+  
+      // Assuming aiProcessEmail function sends data to the AI model for summarization
+      const summary = await aiProcessEmail(prompt); 
+  
+      return summary;
+    } catch (error) {
+      console.error("Error summarizing data:", error);
+      return "Failed to summarize the data.";
+    }
+  }
+
+  async function getEmails(query: string, gmail: gmail_v1.Gmail) {
+    try {
+      const res = await gmail.users.messages.list({
+        userId: "me",
+        q: query,
+        maxResults: 10, // Fetch max 10 emails
+      });
+  
+      // Ensure `res.data.messages` exists before using it
+      const messages = res.data?.messages || [];
+      if (messages.length === 0) {
+        console.warn(`No emails found for query: "${query}"`);
+        return [];
+      }
+  
+      const emails = [];
+  
+      for (const message of messages) {
+        if (!message.id) continue; // Skip invalid messages
+  
+        const msg = await gmail.users.messages.get({
+          userId: "me",
+          id: message.id,
+        });
+  
+        if (!msg.data.payload?.headers) continue; // Skip if no headers
+  
+        // Extract email metadata
+        const headers = msg.data.payload.headers;
+        const subject = headers.find((h) => h.name === "Subject")?.value || "No Subject";
+        const from = headers.find((h) => h.name === "From")?.value || "Unknown Sender";
+        const date = headers.find((h) => h.name === "Date")?.value || "Unknown Date";
+        const isRead = !(msg.data.labelIds?.includes("UNREAD"));
+  
+        emails.push({
+          id: message.id,
+          subject,
+          from,
+          date: new Date(date).toLocaleString(),
+          snippet: msg.data.snippet || "No snippet available",
+          isRead,
+        });
+      }
+  
+      return emails;
+    } catch (error: any) {
+      console.error(`Error fetching emails: ${error.message}`, error);
+      return [];
+    }
+  }
   
 
 
 
-
-// Gmail API Functions
-export async function getEmails(query: string, gmail: any) {
+  export async function getEmailDetails(id: string, gmail: any) {
     try {
-        // Fetch the list of message IDs based on the query
-        const response = await gmail.users.messages.list({
-            userId: "me",
-            q: query,
-            maxResults: 10,
+      const message = await gmail.users.messages.get({ userId: "me", id: id });
+      const threadId = message.data.threadId;
+  
+      if (!threadId) {
+        return { error: "No thread found" }; // Ensure consistent error object
+      }
+  
+      const thread = await gmail.users.threads.get({ userId: "me", id: threadId });
+      const messages = thread.data.messages || [];
+  
+      const structuredThread = messages.map((msg: any) => {
+        const headers = msg.payload?.headers || [];
+        const subject = headers.find((h: any) => h.name === "Subject")?.value || "(No Subject)";
+        const from = headers.find((h: any) => h.name === "From")?.value || "Unknown Sender";
+        const to = headers.find((h: any) => h.name === "To")?.value || "Unknown Recipient";
+        const date = headers.find((h: any) => h.name === "Date")?.value || "Unknown Date";
+  
+        const extractedData = extractMessageParts(msg.payload?.parts || []);
+        let emailBody = extractedData.html || extractedData.text || "No content available";
+  
+        extractedData.images.forEach((img: any) => {
+          emailBody = emailBody.replace(
+            new RegExp(`cid:${img.cid}`, "g"),
+            `/api/attachment?messageId=${msg.id}&attachmentId=${img.attachmentId}`
+          );
         });
-
-        // If no messages, return an empty array
-        if (!response.data.messages) {
-            return [];
-        }
-
-        // Fetch detailed information for each email
-        const emails = await Promise.all(
-            response.data.messages.map(async (message: { id: string }) => {
-                const emailDetails = await gmail.users.messages.get({
-                    userId: "me",
-                    id: message.id,
-                });
-
-                const headers = emailDetails.data.payload.headers;
-                const subject = headers.find((header: { name: string; value: string }) => header.name === "Subject")?.value;
-                const from = headers.find((header: { name: string; value: string }) => header.name === "From")?.value;
-                const contentType = headers.find((header: { name: string; value: string }) => header.name === "Content-Type")?.value;
-
-                // Extract email body
-                const body = getEmailBody(emailDetails.data.payload);
-
-                // Filter out emails containing HTML, XML, or styles
-                if (
-                    contentType?.includes("text/html") ||
-                    contentType?.includes("multipart/alternative") ||
-                    /<html|<style|<xml/i.test(body)
-                ) {
-                    return null; // Exclude this email
-                }
-
-                return {
-                    id: message.id,
-                    subject,
-                    from,
-                    body,
-                };
-            })
-        );
-
-        // Filter out null values (excluded emails)
-        return emails.filter(email => email !== null);
-    } catch (error) {
-        console.error("Error fetching emails:", error);
-        return [];
-    }
-}
-
-// Helper function to extract the email body
-function getEmailBody(payload: any) {
-    try {
-        let body = "";
-
-        if (payload.parts && Array.isArray(payload.parts)) {
-            body = payload.parts
-                .map((part: any) => {
-                    if (
-                        part.mimeType === "text/plain" && // Ensure it's plain text
-                        part.body &&
-                        part.body.data
-                    ) {
-                        return decodeBase64(part.body.data);
-                    }
-                    return "";
-                })
-                .join("");
-        } else if (payload.body && payload.body.data) {
-            body = decodeBase64(payload.body.data);
-        }
-
-        return body;
-    } catch (error) {
-        console.error("Error decoding email body:", error);
-        return "";
-    }
-}
-
-// Decode base64-encoded string
-function decodeBase64(encoded: string) {
-    try {
-        return atob(encoded.replace(/-/g, "+").replace(/_/g, "/")); // Handle URL-safe base64 encoding
-    } catch (error) {
-        console.error("Error decoding base64 string:", error);
-        return "";
-    }
-}
-export async function getEmailDetails(id: string, gmail: any) {
-    try {
-      const response = await gmail.users.messages.get({ userId: "me", id });
-      return response.data;
+  
+        const llmData = {
+          message_id: msg.id,
+          thread_id: msg.threadId,
+          metadata: {
+            subject,
+            from,
+            to,
+            date,
+          },
+          content: {
+            text: (extractedData.text.replace(/\s+/g, " ").trim() + "  " + convert(extractedData.html || "")).replace(/\n/g, " "),
+          },
+          attachments: extractedData.attachments.map((att: any) => ({
+            filename: att.filename,
+            mimeType: att.mimeType,
+          })),
+          images: extractedData.images || [],
+        };
+  
+        return {
+          data: JSON.stringify(llmData),
+        };
+      });
+      const groupedLLData = structuredThread.map((email: any) => {
+        // Ensure that each email's 'data' is a string. If it's an object, convert it to a string.
+        return typeof email.data === 'string' ? email.data : JSON.stringify(email.data);
+      });
+      
+     
+      console.log(message.data.payload.headers)
+      const summarizedData = await summarizeData(groupedLLData);
+     
+      
+    
+     
+      return {
+        data: summarizedData,
+        headers: message.data.payload.headers, // Consistent return with headers
+      };
     } catch (error) {
       console.error("Error fetching email details:", error);
-      return "Failed to fetch email details.";
+      return { error: "Failed to fetch email details." }; // Return a consistent error object
     }
   }
   
   export async function sendEmail(to: string, subject: string, message: string, gmail: any) {
     const emailContent = `To: ${to}\nSubject: ${subject}\n\n${message}`;
     const encodedMessage = Buffer.from(emailContent).toString("base64");
-  
+    console.log(to,subject,message,gmail)
     try {
       await gmail.users.messages.send({ userId: "me", requestBody: { raw: encodedMessage } });
       return `Email successfully sent to ${to}.`;
@@ -300,29 +333,116 @@ export async function getEmailDetails(id: string, gmail: any) {
   }
   
   export async function replyToEmail(id: string, message: string, gmail: any) {
-    const emailDetails = await getEmailDetails(id, gmail);
-    if (!emailDetails || !emailDetails.payload) return "Failed to retrieve email details for reply.";
-  
-    type EmailHeader = { name: string; value: string };
-    const headers: EmailHeader[] = emailDetails.payload.headers as EmailHeader[];
-  
-    const to = headers.find((header) => header.name === "From")?.value;
-    const subject = headers.find((header) => header.name === "Subject")?.value || "";
-  
-    if (!to) return "Recipient not found.";
-  
-    const replySubject = subject.startsWith("Re:") ? subject : `Re: ${subject}`;
-    const emailContent = `To: ${to}\nSubject: ${replySubject}\nIn-Reply-To: ${id}\nReferences: ${id}\n\n${message}`;
-    const encodedMessage = Buffer.from(emailContent).toString("base64");
-  
     try {
-      await gmail.users.messages.send({ userId: "me", requestBody: { raw: encodedMessage } });
-      return `Reply successfully sent to ${to}.`;
+        // Fetch email details
+        const emailDetails = await getEmailDetails(id, gmail);
+
+        // Check if there was an error fetching the email details
+        if (emailDetails.error) {
+            return emailDetails.error; // Return the error message from getEmailDetails
+        }
+
+        // Generate a reply using the LLM (AI) model
+        const chatResponse = await mistral.chat.complete({
+          model: 'mistral-7B', // Replace with your model name
+          messages: [
+              {
+                  role: "user",
+                  content: `Please generate a response to the following email. The response should follow this JSON format:
+                  {
+                     
+                          "message": "The content of the AI-generated response.",
+                          "metadata": {
+                              "tone": "friendly",
+                              "summary": "A short summary of the reply or message."
+                          },
+                          "attachments": [
+                              {
+                                  "filename": "example.jpg",
+                                  "mimeType": "image/jpeg",
+                                  "url": "http://example.com/path/to/image.jpg"
+                              }
+                          ]
+                     
+                  }
+      
+                  Original Email:
+                  ${emailDetails.data}`
+              }
+          ],
+          responseFormat: { type: "json_object" }
+      });
+      
+      // Parse the response content to an object first
+      const content = chatResponse?.choices?.[0]?.message?.content;
+
+      let parsedContent: string;
+      
+      if (typeof content === 'string') {
+          parsedContent = content;  // It's already a string
+      } else if (Array.isArray(content)) {
+          parsedContent = content.join('');  // Convert the ContentChunk[] to a string by joining them
+      } else {
+          parsedContent = '';  // If it's neither, set it as an empty string or handle it as needed
+      }
+      
+      const parsedResponse: ChatResponse = JSON.parse(parsedContent || '{}');
+
+      
+      // Extract AI-generated content from parsed response
+      const aiGeneratedReply = parsedResponse?.message || "No reply generated.";
+      const aiResponseMetadata = parsedResponse?.metadata;
+      const aiAttachments = parsedResponse?.attachments;
+      
+        // Proceed with the reply if headers are available
+        const headers: { name: string; value: string }[] = emailDetails.headers || [];
+        const to = headers.find((header) => header.name === "From")?.value;
+        const subject = headers.find((header) => header.name === "Subject")?.value || "";
+
+        // If no recipient is found, return an error
+        if (!to) return "Recipient not found.";
+
+        // Create a reply subject, prepending 'Re:' if necessary
+        const replySubject = subject.startsWith("Re:") ? subject : `Re: ${subject}`;
+
+        // Format the full email content for the reply
+        const emailContent = `To: ${to}\nSubject: ${replySubject}\nIn-Reply-To: ${id}\nReferences: ${id}\n\n${aiGeneratedReply}`;
+
+        // Encode the email content in base64 format for Gmail API
+        const encodedMessage = Buffer.from(emailContent).toString("base64");
+
+        // Send the reply using the Gmail API
+        await gmail.users.messages.send({
+            userId: "me",
+            requestBody: { raw: encodedMessage },
+        });
+
+        // Handle attachments if available
+        if (aiAttachments && aiAttachments.length > 0) {
+          for (const attachment of aiAttachments) {
+              // Fetch the attachment from the URL
+              const attachmentContent = await fetch(attachment.url)
+                  .then(res => res.arrayBuffer());  // Use arrayBuffer() instead of buffer()
+      
+              // You would need logic here to upload and attach files using Gmail API
+          }
+      }
+      
+
+        // Handle metadata if needed
+        if (aiResponseMetadata) {
+            console.log('Metadata:', aiResponseMetadata);
+            // You can handle or store metadata here (e.g., logging the tone/summary)
+        }
+
+        return `Reply successfully sent to ${to}.`;
     } catch (error) {
-      console.error("Error replying to email:", error);
-      return "Failed to send reply.";
+        console.error("Error replying to email:", error);
+        return "Failed to send reply.";
     }
-  }
+}
+
+  
   
   export async function deleteEmail(id: string, gmail: any) {
     try {
@@ -364,13 +484,52 @@ export async function getEmailDetails(id: string, gmail: any) {
     }
   }
   
-  export async function getStarredEmails(gmail: any) {
-    try {
-      const response = await gmail.users.messages.list({ userId: "me", q: "is:starred", maxResults: 10 });
-      return response.data.messages || "No starred emails found.";
-    } catch (error) {
-      console.error("Error fetching starred emails:", error);
-      return "Failed to fetch starred emails.";
-    }
-  }
+
+
+
+
+
+
+
+
+
+
+  // Helper function to extract email body, inline images, and attachments
+  function extractMessageParts(parts: any[], extracted: any = { text: "", html: "", images: [], attachments: [] }) {
+    parts.forEach((part) => {
+      if (part.mimeType === "text/plain" && part.body?.data) {
+        extracted.text = Buffer.from(part.body.data, "base64").toString("utf-8");
+      }
+      if (part.mimeType === "text/html" && part.body?.data) {
+        extracted.html = Buffer.from(part.body.data, "base64").toString("utf-8");
+      }
+      if (part.filename && part.body?.attachmentId) {
+        extracted.attachments.push({
+          filename: part.filename,
+          mimeType: part.mimeType,
+          attachmentId: part.body.attachmentId,
+        });
+      }
+      if (part.mimeType?.startsWith("image/") && part.body?.attachmentId) {
+        extracted.images.push({
+          filename: part.filename || "inline-image",
+          mimeType: part.mimeType,
+          attachmentId: part.body.attachmentId,
+          cid: part.headers?.find((h:any) => h.name === "Content-ID")?.value?.replace(/[<>]/g, "") || "",
+        });
+      }
+      if (part.parts) {
+        extractMessageParts(part.parts, extracted); // Recursively extract nested parts
+      }
+    });
   
+    return extracted;
+  }
+
+
+
+
+
+
+
+
